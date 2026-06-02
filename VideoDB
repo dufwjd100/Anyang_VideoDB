@@ -3,7 +3,7 @@ var VIDEO_RENAME_CONFIG = {
   portalDbSheetName: "PortalDB",
   videoDbSheetName: "영상DB",
   daysToScan: 14,
-  dryRun: true
+  dryRun: false
 };
 
 function batchRenameRecentVideos() {
@@ -521,4 +521,18 @@ function toDate_(value) {
 
 function stripTime_(date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function batchRenameAllVideosLiveRunLocked() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    Logger.log("SKIP: 이전 전체 백필 실행이 아직 끝나지 않아 이번 실행을 건너뜁니다.");
+    return;
+  }
+
+  try {
+    batchRenameAllVideosLiveRun();
+  } finally {
+    lock.releaseLock();
+  }
 }
