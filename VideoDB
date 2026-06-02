@@ -69,7 +69,7 @@ function resetBatchRenameAllVideosCursor() {
 }
 
 function batchRenameRecentVideos_(config) {
-  Logger.log("VERSION: portaldb-student-id-demo-keywords-resume-2026-05-26-2354");
+  Logger.log("VERSION: portaldb-student-id-demo-keywords-resume-skip-processed-2026-06-02");
 
   var sheetName = config.sheetName;
   var portalDbSheetName = config.portalDbSheetName;
@@ -128,7 +128,12 @@ function batchRenameRecentVideos_(config) {
   var matchedFiles = 0;
   var renamedFiles = 0;
   var recordedRows = 0;
+  var skippedAlready = 0;
   var videoDbSheet = dryRun ? null : getOrCreateVideoDbSheet_(ss, videoDbSheetName);
+
+  // 이미 영상DB에 기록된 고유번호+날짜 조합을 Set으로 로딩해 Drive API 호출 생략
+  var processedSet = buildProcessedSet_(ss, videoDbSheetName);
+  Logger.log("PROCESSED SET: 기처리 레코드 " + processedSet.size + "건 로드");
 
   Logger.log("START: " + (scanStart ? "최근 " + daysToScan + "일" : "전체 기간") + " 출석부 검사. dryRun=" + dryRun);
 
@@ -149,6 +154,7 @@ function batchRenameRecentVideos_(config) {
       Logger.log("PAUSE: 실행시간 보호를 위해 Row " + rowNumber + "에서 중단합니다. 다음 실행 때 이어서 처리합니다.");
       Logger.log(
         "PARTIAL: scannedRows=" + scannedRows +
+        ", skippedAlready=" + skippedAlready +
         ", matchedFiles=" + matchedFiles +
         ", renamedFiles=" + renamedFiles +
         ", recordedRows=" + recordedRows +
@@ -175,6 +181,13 @@ function batchRenameRecentVideos_(config) {
     }
 
     scannedRows++;
+
+    // 이미 처리된 고유번호+날짜 조합이면 Drive API 호출 없이 건너뜀
+    var processedKey = normalizeKey_(uniqueId) + "|" + Utilities.formatDate(lessonDate, tz, "yyyy-MM-dd");
+    if (processedSet.has(processedKey)) {
+      skippedAlready++;
+      continue;
+    }
 
     var folderId = portalFolderMap[normalizeKey_(uniqueId)] || "";
     if (!folderId) {
@@ -248,6 +261,7 @@ function batchRenameRecentVideos_(config) {
 
   Logger.log(
     "DONE: scannedRows=" + scannedRows +
+    ", skippedAlready=" + skippedAlready +
     ", matchedFiles=" + matchedFiles +
     ", renamedFiles=" + renamedFiles +
     ", recordedRows=" + recordedRows +
@@ -336,6 +350,34 @@ function appendVideoDbRow_(sheet, row) {
 
 function getVideoType_(contentVal) {
   return isTeacherDemoVideo_(contentVal) ? "선생님시범" : "수업영상";
+}
+
+function buildProcessedSet_(ss, sheetName) {
+  var set = { _data: {}, has: function(k) { return !!this._data[k]; }, add: function(k) { this._data[k] = true; }, size: 0 };
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return set;
+
+  var lastCol = sheet.getLastColumn();
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var idxId = findHeaderIndex_(headers, ["고유번호"]);
+  var idxDate = findHeaderIndex_(headers, ["날짜"]);
+  if (idxId === -1 || idxDate === -1) return set;
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
+  for (var r = 0; r < values.length; r++) {
+    var uid = normalizeKey_(values[r][idxId]);
+    var dateVal = values[r][idxDate];
+    if (!uid || !dateVal) continue;
+    var d = toDate_(dateVal);
+    if (!d) continue;
+    var dateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
+    var key = uid + "|" + dateStr;
+    if (!set.has(key)) {
+      set.add(key);
+      set.size++;
+    }
+  }
+  return set;
 }
 
 function buildPortalFolderMap_(ss, sheetName) {
