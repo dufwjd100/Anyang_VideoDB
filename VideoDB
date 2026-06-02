@@ -1,0 +1,482 @@
+var VIDEO_RENAME_CONFIG = {
+  sheetName: "출석부",
+  portalDbSheetName: "PortalDB",
+  videoDbSheetName: "영상DB",
+  daysToScan: 14,
+  dryRun: true
+};
+
+function batchRenameRecentVideos() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) {
+    Logger.log("SKIP: 이전 실행이 아직 끝나지 않아 이번 실행을 건너뜁니다.");
+    return;
+  }
+
+  try {
+    batchRenameRecentVideos_(VIDEO_RENAME_CONFIG);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function batchRenameRecentVideosDryRun() {
+  batchRenameRecentVideos_({
+    sheetName: "출석부",
+    portalDbSheetName: "PortalDB",
+    videoDbSheetName: "영상DB",
+    daysToScan: 14,
+    dryRun: true
+  });
+}
+
+function batchRenameRecentVideosLiveRun() {
+  batchRenameRecentVideos_({
+    sheetName: "출석부",
+    portalDbSheetName: "PortalDB",
+    videoDbSheetName: "영상DB",
+    daysToScan: 14,
+    dryRun: false
+  });
+}
+
+function batchRenameAllVideosDryRun() {
+  batchRenameRecentVideos_({
+    sheetName: "출석부",
+    portalDbSheetName: "PortalDB",
+    videoDbSheetName: "영상DB",
+    daysToScan: null,
+    dryRun: true
+  });
+}
+
+function batchRenameAllVideosLiveRun() {
+  batchRenameRecentVideos_({
+    sheetName: "출석부",
+    portalDbSheetName: "PortalDB",
+    videoDbSheetName: "영상DB",
+    daysToScan: null,
+    dryRun: false,
+    resumeKey: "batchRenameAllVideosLiveRun.nextRow",
+    maxRuntimeMs: 300000,
+    verboseSkips: false
+  });
+}
+
+function resetBatchRenameAllVideosCursor() {
+  PropertiesService.getScriptProperties().deleteProperty("batchRenameAllVideosLiveRun.nextRow");
+  Logger.log("RESET: 전체 영상 백필 커서를 초기화했습니다.");
+}
+
+function batchRenameRecentVideos_(config) {
+  Logger.log("VERSION: portaldb-student-id-demo-keywords-resume-2026-05-26-2354");
+
+  var sheetName = config.sheetName;
+  var portalDbSheetName = config.portalDbSheetName;
+  var videoDbSheetName = config.videoDbSheetName;
+  var daysToScan = config.daysToScan;
+  var dryRun = config.dryRun;
+  var startedAt = new Date().getTime();
+  var maxRuntimeMs = config.maxRuntimeMs || 0;
+  var resumeKey = config.resumeKey || "";
+  var verboseSkips = config.verboseSkips !== false;
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log("STOP: 시트를 찾을 수 없습니다: " + sheetName);
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow < 2) {
+    Logger.log("STOP: 검사할 데이터가 없습니다.");
+    return;
+  }
+
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  var data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  Logger.log("HEADERS: " + JSON.stringify(headers));
+
+  var idxDate = findHeaderIndex_(headers, ["날짜", "수업일", "수업날짜", "레슨일", "레슨날짜"]);
+  var idxUniqueId = findHeaderIndex_(headers, ["고유번호", "ID", "출석ID", "출석부ID", "키"]);
+  var idxStudent = findHeaderIndex_(headers, ["학생명", "학생", "이름", "수강생", "회원명"]);
+  var idxSong = findHeaderIndex_(headers, ["수업곡", "곡", "곡명", "레슨곡"]);
+  var idxContent = findHeaderIndex_(headers, ["수업내용", "내용", "레슨내용"]);
+  var idxTeacher = findHeaderIndex_(headers, ["강사명", "강사", "선생님", "담당강사"]);
+  var idxPart = findHeaderIndex_(headers, ["파트", "악기", "전공"]);
+
+  if (idxDate === -1 || idxUniqueId === -1) {
+    Logger.log("STOP: 출석부에서 날짜 또는 고유번호 컬럼을 찾지 못했습니다.");
+    Logger.log("날짜 index=" + idxDate + ", 고유번호 index=" + idxUniqueId);
+    return;
+  }
+
+  var portalFolderMap = buildPortalFolderMap_(ss, portalDbSheetName);
+
+  var tz = Session.getScriptTimeZone();
+  var scanStart = null;
+  if (daysToScan !== null && daysToScan !== undefined && daysToScan !== "") {
+    var today = stripTime_(new Date());
+    scanStart = new Date(today);
+    scanStart.setDate(today.getDate() - daysToScan);
+  }
+
+  var scannedRows = 0;
+  var matchedFiles = 0;
+  var renamedFiles = 0;
+  var recordedRows = 0;
+  var videoDbSheet = dryRun ? null : getOrCreateVideoDbSheet_(ss, videoDbSheetName);
+
+  Logger.log("START: " + (scanStart ? "최근 " + daysToScan + "일" : "전체 기간") + " 출석부 검사. dryRun=" + dryRun);
+
+  var startIndex = 0;
+  if (resumeKey) {
+    var savedNextRow = Number(PropertiesService.getScriptProperties().getProperty(resumeKey) || 2);
+    if (savedNextRow > 2) {
+      startIndex = Math.max(0, savedNextRow - 2);
+      Logger.log("RESUME: Row " + savedNextRow + "부터 이어서 실행합니다.");
+    }
+  }
+
+  for (var r = startIndex; r < data.length; r++) {
+    var rowNumber = r + 2;
+
+    if (maxRuntimeMs && new Date().getTime() - startedAt > maxRuntimeMs) {
+      PropertiesService.getScriptProperties().setProperty(resumeKey, String(rowNumber));
+      Logger.log("PAUSE: 실행시간 보호를 위해 Row " + rowNumber + "에서 중단합니다. 다음 실행 때 이어서 처리합니다.");
+      Logger.log(
+        "PARTIAL: scannedRows=" + scannedRows +
+        ", matchedFiles=" + matchedFiles +
+        ", renamedFiles=" + renamedFiles +
+        ", recordedRows=" + recordedRows +
+        ", dryRun=" + dryRun
+      );
+      return;
+    }
+
+    var rowData = data[r];
+    var dateVal = rowData[idxDate];
+    var uniqueId = rowData[idxUniqueId];
+
+    if (!dateVal) {
+      if (verboseSkips) Logger.log("SKIP Row " + rowNumber + ": 날짜 없음");
+      continue;
+    }
+    var lessonDate = toDate_(dateVal);
+    if (!lessonDate) {
+      Logger.log("SKIP Row " + rowNumber + ": 날짜 해석 실패: " + dateVal);
+      continue;
+    }
+    if (scanStart && stripTime_(lessonDate) < scanStart) {
+      continue;
+    }
+
+    scannedRows++;
+
+    var folderId = portalFolderMap[normalizeKey_(uniqueId)] || "";
+    if (!folderId) {
+      if (verboseSkips) Logger.log("SKIP Row " + rowNumber + ": PortalDB에서 폴더 ID 찾기 실패. 고유번호=" + uniqueId);
+      continue;
+    }
+
+    var formattedDate = Utilities.formatDate(lessonDate, tz, "yyyyMMdd");
+    var lessonDateText = Utilities.formatDate(lessonDate, tz, "yyyy-MM-dd");
+    var matchDateStr = Utilities.formatDate(lessonDate, tz, "yyyy-MM-dd");
+    var studentVal = idxStudent === -1 ? "" : rowData[idxStudent];
+    var songVal = idxSong === -1 ? "" : rowData[idxSong];
+    var contentVal = idxContent === -1 ? "" : rowData[idxContent];
+    var teacherVal = idxTeacher === -1 ? "" : rowData[idxTeacher];
+    var partVal = idxPart === -1 ? "" : rowData[idxPart];
+    var prefix = buildPrefix_(formattedDate, songVal, contentVal);
+
+    try {
+      var folder = DriveApp.getFolderById(folderId);
+      var files = folder.getFiles();
+
+      while (files.hasNext()) {
+        var file = files.next();
+        var currentName = file.getName();
+        var createdDate = Utilities.formatDate(file.getDateCreated(), tz, "yyyy-MM-dd");
+
+        if (!isLikelyVideo_(file, currentName)) continue;
+        if (createdDate !== matchDateStr) continue;
+        if (currentName.indexOf(formattedDate + "_") === 0) {
+          if (verboseSkips) Logger.log("SKIP Row " + rowNumber + ": 이미 처리됨: " + currentName);
+          continue;
+        }
+
+        matchedFiles++;
+
+        var newName = buildSafeVideoName_(prefix, currentName);
+        var dbRow = buildVideoDbRow_({
+          processedAt: new Date(),
+          uniqueId: uniqueId,
+          student: studentVal,
+          lessonDate: lessonDateText,
+          song: songVal,
+          content: contentVal,
+          teacher: teacherVal,
+          part: partVal,
+          originalName: currentName,
+          renamedName: newName,
+          fileId: file.getId(),
+          fileUrl: file.getUrl(),
+          folderId: folderId,
+          fileCreatedAt: createdDate,
+          videoType: getVideoType_(contentVal),
+          status: dryRun ? "DRY_RUN" : "처리완료"
+        });
+
+        if (dryRun) {
+          Logger.log("DRY_RUN Row " + rowNumber + ": " + currentName + " -> " + newName);
+          Logger.log("DRY_RUN 영상DB Row " + rowNumber + ": " + JSON.stringify(dbRow));
+        } else {
+          file.setName(newName);
+          appendVideoDbRow_(videoDbSheet, dbRow);
+          renamedFiles++;
+          recordedRows++;
+          Logger.log("RENAMED Row " + rowNumber + ": " + currentName + " -> " + newName);
+        }
+      }
+    } catch (err) {
+      Logger.log("ERROR Row " + rowNumber + ": " + err.toString());
+    }
+  }
+
+  Logger.log(
+    "DONE: scannedRows=" + scannedRows +
+    ", matchedFiles=" + matchedFiles +
+    ", renamedFiles=" + renamedFiles +
+    ", recordedRows=" + recordedRows +
+    ", dryRun=" + dryRun
+  );
+
+  if (resumeKey) {
+    PropertiesService.getScriptProperties().deleteProperty(resumeKey);
+    Logger.log("COMPLETE: 전체 영상 백필 커서를 삭제했습니다.");
+  }
+}
+
+function getOrCreateVideoDbSheet_(ss, sheetName) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  }
+
+  var headers = getVideoDbHeaders_();
+  var lastCol = sheet.getLastColumn();
+  var existingHeaders = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : [];
+
+  if (existingHeaders.length === 0 || existingHeaders[0] === "") {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return sheet;
+  }
+
+  var missingHeaders = [];
+  for (var i = 0; i < headers.length; i++) {
+    if (existingHeaders.indexOf(headers[i]) === -1) missingHeaders.push(headers[i]);
+  }
+
+  if (missingHeaders.length > 0) {
+    sheet.getRange(1, existingHeaders.length + 1, 1, missingHeaders.length).setValues([missingHeaders]);
+  }
+
+  return sheet;
+}
+
+function getVideoDbHeaders_() {
+  return [
+    "처리일시",
+    "고유번호",
+    "학생명",
+    "날짜",
+    "수업곡",
+    "수업내용",
+    "강사명",
+    "파트",
+    "원본파일명",
+    "변경된파일명",
+    "파일ID",
+    "파일URL",
+    "폴더ID",
+    "파일생성일",
+    "영상구분",
+    "처리상태"
+  ];
+}
+
+function buildVideoDbRow_(data) {
+  return [
+    data.processedAt,
+    data.uniqueId,
+    data.student,
+    data.lessonDate,
+    data.song,
+    data.content,
+    data.teacher,
+    data.part,
+    data.originalName,
+    data.renamedName,
+    data.fileId,
+    data.fileUrl,
+    data.folderId,
+    data.fileCreatedAt,
+    data.videoType,
+    data.status
+  ];
+}
+
+function appendVideoDbRow_(sheet, row) {
+  var headers = getVideoDbHeaders_();
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, headers.length).setValues([row]);
+}
+
+function getVideoType_(contentVal) {
+  return isTeacherDemoVideo_(contentVal) ? "선생님시범" : "수업영상";
+}
+
+function buildPortalFolderMap_(ss, sheetName) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log("STOP: 포털디비 시트를 찾을 수 없습니다: " + sheetName);
+    return {};
+  }
+
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow < 2) {
+    Logger.log("STOP: 포털디비에 데이터가 없습니다.");
+    return {};
+  }
+
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  Logger.log("PORTAL HEADERS: " + JSON.stringify(headers));
+
+  var idxUniqueId = findHeaderIndex_(headers, ["고유번호", "학생고유번호", "학생ID", "학생id", "회원번호"]);
+  var idxFolderId = findHeaderIndex_(headers, [
+    "폴더아이디",
+    "폴더ID",
+    "폴더id",
+    "드라이브폴더아이디",
+    "드라이브폴더ID",
+    "학생드라이브폴더아이디",
+    "학생드라이브폴더ID",
+    "학생드라이브링크",
+    "드라이브링크",
+    "폴더링크"
+  ]);
+
+  if (idxUniqueId === -1 || idxFolderId === -1) {
+    Logger.log("STOP: PortalDB에서 고유번호 또는 폴더ID 컬럼을 찾지 못했습니다.");
+    Logger.log("PortalDB 고유번호 index=" + idxUniqueId + ", 폴더ID index=" + idxFolderId);
+    return {};
+  }
+
+  var values = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  var map = {};
+  for (var r = 0; r < values.length; r++) {
+    var uniqueId = values[r][idxUniqueId];
+    var folderRef = values[r][idxFolderId];
+    var folderId = extractDriveFolderId_(folderRef);
+    if (uniqueId && folderId) {
+      map[normalizeKey_(uniqueId)] = folderId;
+    }
+  }
+
+  Logger.log("PORTAL MAP: 폴더 매핑 " + Object.keys(map).length + "건 로드");
+  return map;
+}
+
+function findHeaderIndex_(headers, candidates) {
+  var normalizedCandidates = {};
+  for (var i = 0; i < candidates.length; i++) {
+    normalizedCandidates[normalizeHeader_(candidates[i])] = true;
+  }
+
+  for (var h = 0; h < headers.length; h++) {
+    if (normalizedCandidates[normalizeHeader_(headers[h])]) return h;
+  }
+
+  return -1;
+}
+
+function normalizeHeader_(value) {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/[\[\]_\-()]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeKey_(value) {
+  return String(value || "").trim();
+}
+
+function buildPrefix_(formattedDate, songVal, contentVal) {
+  var cleanSong = sanitizeFileName_(songVal);
+  var cleanContent = sanitizeFileName_(contentVal);
+  var isDemo = isTeacherDemoVideo_(contentVal) ? "_★선생님시범" : "";
+
+  var parts = [formattedDate];
+  if (cleanSong) parts.push(cleanSong);
+  if (cleanContent) parts.push(cleanContent + isDemo);
+
+  return parts.join("_");
+}
+
+function isTeacherDemoVideo_(contentVal) {
+  var text = String(contentVal || "").replace(/\s+/g, "");
+  return text.indexOf("시범") !== -1 || text.indexOf("영상참고") !== -1;
+}
+
+function isLikelyVideo_(file, name) {
+  var mimeType = file.getMimeType() || "";
+  var fileName = String(name || "");
+
+  return mimeType.indexOf("video") !== -1 ||
+    fileName.indexOf("IMG_") === 0 ||
+    fileName.indexOf("VID_") === 0;
+}
+
+function buildSafeVideoName_(prefix, currentName) {
+  var newName = prefix + " " + currentName;
+  if (newName.length <= 180) return newName;
+
+  var maxPrefixLength = Math.max(20, 170 - String(currentName).length);
+  return prefix.substring(0, maxPrefixLength) + " " + currentName;
+}
+
+function extractDriveFolderId_(url) {
+  var text = String(url || "").trim();
+
+  var match = text.match(/folders\/([a-zA-Z0-9_-]+)/);
+  if (match && match[1]) return match[1];
+
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(text)) return text;
+
+  return "";
+}
+
+function sanitizeFileName_(value) {
+  return String(value || "")
+    .replace(/[\/:*?"<>|]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function toDate_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return value;
+  }
+
+  var date = new Date(value);
+  if (isNaN(date.getTime())) return null;
+  return date;
+}
+
+function stripTime_(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
