@@ -69,7 +69,7 @@ function resetBatchRenameAllVideosCursor() {
 }
 
 function batchRenameRecentVideos_(config) {
-  Logger.log("VERSION: portaldb-student-id-demo-keywords-resume-skip-processed-2026-06-02");
+  Logger.log("VERSION: portaldb-file-id-dedup-2026-06-04");
 
   var sheetName = config.sheetName;
   var portalDbSheetName = config.portalDbSheetName;
@@ -131,9 +131,9 @@ function batchRenameRecentVideos_(config) {
   var skippedAlready = 0;
   var videoDbSheet = dryRun ? null : getOrCreateVideoDbSheet_(ss, videoDbSheetName);
 
-  // 이미 영상DB에 기록된 고유번호+날짜 조합을 Set으로 로딩해 Drive API 호출 생략
-  var processedSet = buildProcessedSet_(ss, videoDbSheetName);
-  Logger.log("PROCESSED SET: 기처리 레코드 " + processedSet.size + "건 로드");
+  // 이미 영상DB에 기록된 파일ID를 Set으로 로딩해 같은 파일만 중복 처리 방지
+  var processedFileIdSet = buildProcessedFileIdSet_(ss, videoDbSheetName);
+  Logger.log("PROCESSED FILE SET: 기처리 파일ID " + processedFileIdSet.size + "건 로드");
 
   Logger.log("START: " + (scanStart ? "최근 " + daysToScan + "일" : "전체 기간") + " 출석부 검사. dryRun=" + dryRun);
 
@@ -182,13 +182,6 @@ function batchRenameRecentVideos_(config) {
 
     scannedRows++;
 
-    // 이미 처리된 고유번호+날짜 조합이면 Drive API 호출 없이 건너뜀
-    var processedKey = normalizeKey_(uniqueId) + "|" + Utilities.formatDate(lessonDate, tz, "yyyy-MM-dd");
-    if (processedSet.has(processedKey)) {
-      skippedAlready++;
-      continue;
-    }
-
     var folderId = portalFolderMap[normalizeKey_(uniqueId)] || "";
     if (!folderId) {
       if (verboseSkips) Logger.log("SKIP Row " + rowNumber + ": PortalDB에서 폴더 ID 찾기 실패. 고유번호=" + uniqueId);
@@ -211,9 +204,14 @@ function batchRenameRecentVideos_(config) {
 
       while (files.hasNext()) {
         var file = files.next();
+        var fileId = file.getId();
         var currentName = file.getName();
         var createdDate = Utilities.formatDate(file.getDateCreated(), tz, "yyyy-MM-dd");
 
+        if (processedFileIdSet.has(fileId)) {
+          skippedAlready++;
+          continue;
+        }
         if (!isLikelyVideo_(file, currentName)) continue;
         if (createdDate !== matchDateStr) continue;
         if (currentName.indexOf(formattedDate + "_") === 0) {
@@ -235,7 +233,7 @@ function batchRenameRecentVideos_(config) {
           part: partVal,
           originalName: currentName,
           renamedName: newName,
-          fileId: file.getId(),
+          fileId: fileId,
           fileUrl: file.getUrl(),
           folderId: folderId,
           fileCreatedAt: createdDate,
@@ -249,6 +247,8 @@ function batchRenameRecentVideos_(config) {
         } else {
           file.setName(newName);
           appendVideoDbRow_(videoDbSheet, dbRow);
+          processedFileIdSet.add(fileId);
+          processedFileIdSet.size++;
           renamedFiles++;
           recordedRows++;
           Logger.log("RENAMED Row " + rowNumber + ": " + currentName + " -> " + newName);
@@ -352,28 +352,23 @@ function getVideoType_(contentVal) {
   return isTeacherDemoVideo_(contentVal) ? "선생님시범" : "수업영상";
 }
 
-function buildProcessedSet_(ss, sheetName) {
+function buildProcessedFileIdSet_(ss, sheetName) {
   var set = { _data: {}, has: function(k) { return !!this._data[k]; }, add: function(k) { this._data[k] = true; }, size: 0 };
   var sheet = ss.getSheetByName(sheetName);
   if (!sheet || sheet.getLastRow() < 2) return set;
 
   var lastCol = sheet.getLastColumn();
   var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-  var idxId = findHeaderIndex_(headers, ["고유번호"]);
-  var idxDate = findHeaderIndex_(headers, ["날짜"]);
-  if (idxId === -1 || idxDate === -1) return set;
+  var idxFileId = findHeaderIndex_(headers, ["파일ID", "fileId", "파일아이디"]);
+  if (idxFileId === -1) return set;
 
   var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
   for (var r = 0; r < values.length; r++) {
-    var uid = normalizeKey_(values[r][idxId]);
-    var dateVal = values[r][idxDate];
-    if (!uid || !dateVal) continue;
-    var d = toDate_(dateVal);
-    if (!d) continue;
-    var dateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), "yyyy-MM-dd");
-    var key = uid + "|" + dateStr;
-    if (!set.has(key)) {
-      set.add(key);
+    var fileId = normalizeKey_(values[r][idxFileId]);
+    if (!fileId) continue;
+
+    if (!set.has(fileId)) {
+      set.add(fileId);
       set.size++;
     }
   }
